@@ -1,0 +1,126 @@
+clear;
+close all;
+clc;
+display("Train model.")
+output_directory_name = "";
+data = audioDatastore(output_directory_name, 'IncludeSubfolders', true, 'LabelSource','foldernames');
+[training_data, testing_data] = splitEachLabel(data, 0.9);
+training_data_count = countEachLabel(training_data);
+testing_data_count = countEachLabel(testing_data);
+[train_sample, train_info] = read(training_data);
+fs = train_info.SampleRate;
+window_length   = round(0.03 * fs);
+overlap_length  = round(0.025 * fs);
+audio_feature_extraction = audioFeatureExtractor( ...
+    SampleRate=fs, ...
+    Window=hamming(window_length,"periodic"), ...
+    OverlapLength=overlap_length, ...
+    zerocrossrate=true, ...
+    shortTimeEnergy=true, ...
+    pitch=true, ...
+    mfcc=true);
+feature_info = info(audio_feature_extraction);
+
+features = [];
+labels = [];
+
+energy_threshold = 0.005;
+zcr_threshold = 0.2;
+keep_length = round(length(train_sample)/3);
+
+while hasdata(training_data)
+    [input_data, input_info] = read(training_data);
+    input_data = input_data(1:keep_length);
+    feature = extract(audio_feature_extraction, input_data);
+    is_speech = feature(:,feature_info.shortTimeEnergy)>energy_threshold;
+    is_voiced = feature(:,feature_info.zerocrossrate) < zcr_threshold;
+    voiced_speech = is_speech & is_voiced;
+    feature(~voiced_speech,:) = [];
+    feature(:,[feature_info.zerocrossrate, feature_info.shortTimeEnergy]) = [];
+    label = repelem(input_info.Label, size(feature,1));
+    features = [features;feature];
+    labels = [labels,label];
+end
+
+m = mean(features, 1);
+s = std(features, [], 1);
+features = (features-m)./s;
+
+trained_classifier = fitcknn( ...
+    features, ...
+    labels, ...
+    Distance="euclidean", ...
+    NumNeighbors=5, ...
+    DistanceWeight="squaredinverse", ...
+    Standardize=false, ...
+    ClassNames=unique(labels) ...
+    );
+
+k = 5;
+group = labels;
+c = cvpartition(group, kFold=k);
+partitioned_model = crossval(trained_classifier, CVPartition=c);
+validation_accuracy = 1 - kfoldLoss(partitioned_model ,LossFun="ClassifError");
+fprintf('\nValidation accuracy = %.2f%%\n', validation_accuracy*100);
+
+validationPredictions = kfoldPredict(partitioned_model);
+figure(Units="normalized",Position=[0.4 0.4 0.4 0.4])
+confusionchart(labels,validationPredictions,title="Validation Accuracy", ...
+    ColumnSummary="column-normalized",RowSummary="row-normalized");
+
+features = [];
+labels = [];
+number_vectors_per_file = [];
+while hasdata(testing_data)
+    [input_audio, input_info] = read(testing_data);
+    input_audio = input_audio(1:keep_length);
+    feature = extract(audio_feature_extraction, input_audio);
+    is_speech = feature(:,feature_info.shortTimeEnergy)>energy_threshold;
+    is_voiced = feature(:,feature_info.zerocrossrate) < zcr_threshold;
+    voiced_speech = is_speech & is_voiced;
+
+    feature(~voiced_speech,:)=[];
+    number_vector = size(feature, 1);
+    feature(:,[feature_info.zerocrossrate, feature_info.shortTimeEnergy])=[];
+
+    label = repelem(input_info.Label, number_vector);
+
+    number_vectors_per_file = [number_vectors_per_file, number_vector];
+    features = [features;feature];
+    labels = [labels,label];
+end
+features = (features-m)./s;
+
+prediction = predict(trained_classifier,features);
+prediction = categorical(string(prediction));
+
+figure( ...
+    Units="normalized", ...
+    Position=[0.4 0.4 0.4 0.4] ...
+    )
+confusionchart( ...
+    labels(:), ...
+    prediction, ...
+    title="Test Accuracy (Per Frame)", ...
+    ColumnSummary="column-normalized", ...
+    RowSummary="row-normalized" ...
+    );
+
+adsTest = testing_data;
+numVectorsPerFile = number_vectors_per_file;
+r2 = prediction(1:numel(adsTest.Files));
+idx = 1;
+for ii = 1:numel(adsTest.Files)
+    r2(ii) = mode(prediction(idx:idx+numVectorsPerFile(ii)-1));
+    idx = idx + numVectorsPerFile(ii);
+end
+
+figure(Units="normalized",Position=[0.4 0.4 0.4 0.4])
+confusionchart(adsTest.Labels,r2,title="Test Accuracy (Per File)", ...
+    ColumnSummary="column-normalized",RowSummary="row-normalized");
+
+
+save('trained_classifier.mat','trained_classifier');
+save("feature.mat","feature");
+display("Training done.")
+
